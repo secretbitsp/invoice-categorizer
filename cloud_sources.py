@@ -57,6 +57,89 @@ def list_and_download_gdrive(credentials_json: dict, folder_id: str, progress_ca
     return result
 
 
+def list_and_download_gdrive_public(folder_link: str, progress_callback=None):
+    """
+    Download all PDFs from a public Google Drive folder link (no auth needed).
+
+    Args:
+        folder_link: Google Drive folder URL (must be shared as 'Anyone with the link')
+        progress_callback: fn(current, total, filename)
+
+    Returns:
+        dict of {filename: bytes}
+    """
+    import re
+
+    # Extract folder ID from various Google Drive URL formats
+    match = re.search(r'/folders/([a-zA-Z0-9_-]+)', folder_link)
+    if not match:
+        match = re.search(r'id=([a-zA-Z0-9_-]+)', folder_link)
+    if not match:
+        raise Exception("Could not extract folder ID from the link. Please check the URL.")
+
+    folder_id = match.group(1)
+
+    # Use Google Drive API with API key (public access, no auth)
+    # We'll use the files.list endpoint which works for public folders
+    api_key_url = "https://www.googleapis.com/drive/v3/files"
+
+    pdf_files = []
+    _list_public_pdfs_recursive(api_key_url, folder_id, pdf_files)
+
+    if not pdf_files:
+        return {}
+
+    total = len(pdf_files)
+    result = {}
+
+    for i, (file_id, filename) in enumerate(pdf_files):
+        # Download file content via public link
+        download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key="
+        # Try direct download approach for public files
+        export_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        resp = requests.get(export_url, allow_redirects=True)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            result[filename] = resp.content
+        if progress_callback:
+            progress_callback(i + 1, total, filename)
+
+    return result
+
+
+def _list_public_pdfs_recursive(api_url, folder_id, pdf_files):
+    """List PDFs from a public Google Drive folder without auth."""
+    page_token = None
+    while True:
+        params = {
+            "q": f"'{folder_id}' in parents and trashed=false",
+            "fields": "nextPageToken, files(id, name, mimeType)",
+            "pageSize": 1000,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        resp = requests.get(api_url, params=params)
+
+        if resp.status_code == 403 or resp.status_code == 401:
+            raise Exception(
+                "Cannot access this folder. Make sure it's shared as "
+                "'Anyone with the link can view' in Google Drive sharing settings."
+            )
+        if resp.status_code != 200:
+            raise Exception(f"Google Drive API error: {resp.status_code} - {resp.text[:200]}")
+
+        data = resp.json()
+        for f in data.get('files', []):
+            if f.get('mimeType') == 'application/vnd.google-apps.folder':
+                _list_public_pdfs_recursive(api_url, f['id'], pdf_files)
+            elif f.get('name', '').lower().endswith('.pdf'):
+                pdf_files.append((f['id'], f['name']))
+
+        page_token = data.get('nextPageToken')
+        if not page_token:
+            break
+
+
 def _list_pdfs_recursive(service, folder_id, pdf_files):
     """Recursively list all PDFs in a Google Drive folder."""
     page_token = None

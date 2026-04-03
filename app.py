@@ -361,39 +361,33 @@ else:
 
     with tab_gdrive:
         import json
-        from cloud_sources import list_and_download_gdrive
+        from cloud_sources import list_and_download_gdrive, list_and_download_gdrive_public
 
-        # Check saved credentials
-        has_gd_creds = "gdrive" in st.secrets if hasattr(st, 'secrets') else False
-        gd_saved_creds = None
-        gd_saved_folder = ""
+        gd_mode = st.radio(
+            "Access method",
+            ["Public Link (no setup)", "Service Account"],
+            horizontal=True,
+            key="gd_mode",
+        )
 
-        if has_gd_creds:
-            try:
-                gd_saved_creds = dict(st.secrets["gdrive"]["credentials"])
-                gd_saved_folder = st.secrets["gdrive"].get("folder_id", "")
-            except Exception:
-                has_gd_creds = False
-
-        if has_gd_creds and gd_saved_creds:
-            st.success("Google Drive is configured.")
-            gd_folder_id = st.text_input(
-                "Folder ID",
-                value=gd_saved_folder,
-                help="Change the folder ID if needed, or use the saved default.",
-                key="gd_input_folder",
+        if gd_mode == "Public Link (no setup)":
+            gd_link = st.text_input(
+                "Google Drive Folder Link",
+                placeholder="https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOp...",
+                help="Paste the shared Google Drive folder link. The folder must be set to 'Anyone with the link'.",
+                key="gd_public_link",
             )
 
-            if st.button("Fetch & Categorize", type="primary", disabled=(not gd_folder_id.strip()), use_container_width=True, key="btn_gdrive_input"):
+            if st.button("Fetch & Categorize", type="primary", disabled=(not gd_link.strip()), use_container_width=True, key="btn_gd_public"):
                 progress = st.progress(0, text="Downloading from Google Drive...")
                 status = st.empty()
 
-                def gd_progress(current, total, filename):
+                def gd_pub_progress(current, total, filename):
                     progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
                     status.caption(f"Downloading: {filename}")
 
                 try:
-                    files_map = list_and_download_gdrive(gd_saved_creds, gd_folder_id.strip(), gd_progress)
+                    files_map = list_and_download_gdrive_public(gd_link.strip(), gd_pub_progress)
                     progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
                     status.empty()
                     if not files_map:
@@ -402,8 +396,49 @@ else:
                 except Exception as e:
                     st.error(f"Google Drive error: {e}")
                     files_map = None
+
         else:
-            st.info("**One-time setup** — upload your service account key. It will be saved for next time.")
+            # Check saved credentials
+            has_gd_creds = "gdrive" in st.secrets if hasattr(st, 'secrets') else False
+            gd_saved_creds = None
+            gd_saved_folder = ""
+
+            if has_gd_creds:
+                try:
+                    gd_saved_creds = dict(st.secrets["gdrive"]["credentials"])
+                    gd_saved_folder = st.secrets["gdrive"].get("folder_id", "")
+                except Exception:
+                    has_gd_creds = False
+
+            if has_gd_creds and gd_saved_creds:
+                st.success("Google Drive is configured.")
+                gd_folder_id = st.text_input(
+                    "Folder ID",
+                    value=gd_saved_folder,
+                    help="Change the folder ID if needed, or use the saved default.",
+                    key="gd_input_folder",
+                )
+
+                if st.button("Fetch & Categorize", type="primary", disabled=(not gd_folder_id.strip()), use_container_width=True, key="btn_gdrive_input"):
+                    progress = st.progress(0, text="Downloading from Google Drive...")
+                    status = st.empty()
+
+                    def gd_progress(current, total, filename):
+                        progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
+                        status.caption(f"Downloading: {filename}")
+
+                    try:
+                        files_map = list_and_download_gdrive(gd_saved_creds, gd_folder_id.strip(), gd_progress)
+                        progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
+                        status.empty()
+                        if not files_map:
+                            st.warning("No PDF files found in the folder.")
+                            files_map = None
+                    except Exception as e:
+                        st.error(f"Google Drive error: {e}")
+                        files_map = None
+            else:
+                st.info("**One-time setup** — upload your service account key. It will be saved for next time.")
             gd_creds = st.file_uploader(
                 "Service Account JSON Key",
                 type=["json"],
