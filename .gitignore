@@ -3,10 +3,13 @@ __pycache__/
 .DS_Store
 Invoices/
 invoices/
+invoices-old/
 output/
 output_full/
 *.zip
+*.PDF
 errors.log
 report.csv
 exp.PDF
 invoices.zip
+.streamlit/secrets.toml
