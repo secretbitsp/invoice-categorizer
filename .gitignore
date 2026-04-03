@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+Invoices/
+invoices/
+output/
+output_full/
+*.zip
+errors.log
+report.csv
+exp.PDF
+invoices.zip
