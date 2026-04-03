@@ -134,68 +134,128 @@ if st.session_state.processing_complete:
             )
 
         with gdrive_tab:
-            st.caption("Upload categorized invoices directly to your Google Drive.")
+            import json
+            from gdrive_uploader import upload_to_drive
 
-            creds_file = st.file_uploader(
-                "Service Account JSON Key",
-                type=["json"],
-                help="Upload your Google Cloud service account JSON key file. "
-                     "The service account must have access to the target Drive folder.",
-                key="gdrive_creds",
-            )
+            # Check if credentials are saved
+            has_saved_creds = "gdrive" in st.secrets if hasattr(st, 'secrets') else False
+            gdrive_creds_json = None
+            gdrive_folder = ""
 
-            folder_id = st.text_input(
-                "Google Drive Folder ID",
-                placeholder="e.g. 1AbCdEfGhIjKlMnOpQrStUvWxYz",
-                help="The ID of the Google Drive folder to upload into. "
-                     "You can find it in the folder's URL after /folders/.",
-            )
-
-            gdrive_ready = creds_file is not None and folder_id.strip() != ""
-
-            if st.button(
-                "Upload to Google Drive",
-                type="primary",
-                disabled=(not gdrive_ready),
-                use_container_width=True,
-                key="btn_gdrive",
-            ):
-                import json
-                from gdrive_uploader import upload_to_drive
-
+            if has_saved_creds:
                 try:
-                    creds_json = json.loads(creds_file.read())
+                    gdrive_creds_json = dict(st.secrets["gdrive"]["credentials"])
+                    gdrive_folder = st.secrets["gdrive"].get("folder_id", "")
                 except Exception:
-                    st.error("Invalid JSON key file.")
-                    st.stop()
+                    has_saved_creds = False
 
-                ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
-                files_map = st.session_state.files_map
+            if has_saved_creds and gdrive_creds_json and gdrive_folder:
+                st.success("Google Drive is configured.")
+                st.caption(f"Folder ID: `{gdrive_folder}`")
 
-                if not files_map:
-                    st.error("File data not available. Please process the invoices again.")
-                    st.stop()
+                if st.button("Upload to Google Drive", type="primary", use_container_width=True, key="btn_gdrive"):
+                    ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
+                    files_map = st.session_state.files_map
 
-                progress = st.progress(0, text="Uploading to Google Drive...")
-                status = st.empty()
+                    if not files_map:
+                        st.error("File data not available. Please process the invoices again.")
+                        st.stop()
 
-                def update_progress(current, total, filename):
-                    progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
-                    status.caption(f"Uploading: {filename}")
+                    progress = st.progress(0, text="Uploading to Google Drive...")
+                    status = st.empty()
 
-                try:
-                    result = upload_to_drive(
-                        credentials_json=creds_json,
-                        parent_folder_id=folder_id.strip(),
-                        ok_results=ok_results,
-                        uploaded_files=files_map,
-                        progress_callback=update_progress,
-                    )
-                    progress.progress(1.0, text="Upload complete!")
-                    status.empty()
-                    st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
-                except Exception as e:
-                    st.error(f"Upload failed: {e}")
+                    def update_progress(current, total, filename):
+                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
+                        status.caption(f"Uploading: {filename}")
+
+                    try:
+                        result = upload_to_drive(
+                            credentials_json=gdrive_creds_json,
+                            parent_folder_id=gdrive_folder,
+                            ok_results=ok_results,
+                            uploaded_files=files_map,
+                            progress_callback=update_progress,
+                        )
+                        progress.progress(1.0, text="Upload complete!")
+                        status.empty()
+                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
+            else:
+                # First-time setup
+                st.info("**One-time setup** — configure Google Drive, then it's saved permanently.")
+
+                creds_file = st.file_uploader(
+                    "Service Account JSON Key",
+                    type=["json"],
+                    help="Upload your Google Cloud service account JSON key file.",
+                    key="gdrive_creds",
+                )
+
+                folder_id = st.text_input(
+                    "Google Drive Folder ID",
+                    placeholder="e.g. 1AbCdEfGhIjKlMnOpQrStUvWxYz",
+                    help="The ID from the folder URL (after /folders/).",
+                )
+
+                gdrive_ready = creds_file is not None and folder_id.strip() != ""
+
+                if st.button("Save & Upload to Google Drive", type="primary", disabled=(not gdrive_ready), use_container_width=True, key="btn_gdrive"):
+                    try:
+                        creds_json = json.loads(creds_file.read())
+                    except Exception:
+                        st.error("Invalid JSON key file.")
+                        st.stop()
+
+                    # Show how to save permanently
+                    secrets_toml = f"""[gdrive]
+folder_id = "{folder_id.strip()}"
+
+[gdrive.credentials]
+"""
+                    for k, v in creds_json.items():
+                        if isinstance(v, str):
+                            secrets_toml += f'{k} = """{v}"""\n'
+                        else:
+                            secrets_toml += f"{k} = {json.dumps(v)}\n"
+
+                    with st.expander("Save config permanently (so you don't need to do this again)", expanded=True):
+                        st.markdown(
+                            "**For Streamlit Cloud:** Go to your app dashboard > **Settings** > **Secrets** and paste this:"
+                        )
+                        st.code(secrets_toml, language="toml")
+                        st.markdown(
+                            "**For local:** Save this to `.streamlit/secrets.toml` in the project folder."
+                        )
+
+                    # Still do the upload now
+                    ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
+                    files_map = st.session_state.files_map
+
+                    if not files_map:
+                        st.error("File data not available. Please process the invoices again.")
+                        st.stop()
+
+                    progress = st.progress(0, text="Uploading to Google Drive...")
+                    status = st.empty()
+
+                    def update_progress_first(current, total, filename):
+                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
+                        status.caption(f"Uploading: {filename}")
+
+                    try:
+                        result = upload_to_drive(
+                            credentials_json=creds_json,
+                            parent_folder_id=folder_id.strip(),
+                            ok_results=ok_results,
+                            uploaded_files=files_map,
+                            progress_callback=update_progress_first,
+                        )
+                        progress.progress(1.0, text="Upload complete!")
+                        status.empty()
+                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
 
     # Reset
     st.markdown("")
@@ -279,47 +339,100 @@ else:
                         files_map[os.path.basename(f)] = fh.read()
 
     with tab_gdrive:
-        st.caption("Download invoices from a Google Drive folder, then categorize them.")
-        gd_creds = st.file_uploader(
-            "Service Account JSON Key",
-            type=["json"],
-            help="Upload your Google Cloud service account JSON key file.",
-            key="gd_input_creds",
-        )
-        gd_folder_id = st.text_input(
-            "Folder ID",
-            placeholder="e.g. 1AbCdEfGhIjKlMnOpQrStUvWxYz",
-            help="The folder ID from the Google Drive URL (after /folders/).",
-            key="gd_input_folder",
-        )
+        import json
+        from cloud_sources import list_and_download_gdrive
 
-        gd_ready = gd_creds is not None and gd_folder_id.strip() != ""
-        if st.button("Fetch & Categorize", type="primary", disabled=(not gd_ready), use_container_width=True, key="btn_gdrive_input"):
-            import json
-            from cloud_sources import list_and_download_gdrive
+        # Check saved credentials
+        has_gd_creds = "gdrive" in st.secrets if hasattr(st, 'secrets') else False
+        gd_saved_creds = None
+        gd_saved_folder = ""
+
+        if has_gd_creds:
             try:
-                creds_json = json.loads(gd_creds.read())
+                gd_saved_creds = dict(st.secrets["gdrive"]["credentials"])
+                gd_saved_folder = st.secrets["gdrive"].get("folder_id", "")
             except Exception:
-                st.error("Invalid JSON key file.")
-                st.stop()
+                has_gd_creds = False
 
-            progress = st.progress(0, text="Downloading from Google Drive...")
-            status = st.empty()
+        if has_gd_creds and gd_saved_creds:
+            st.success("Google Drive is configured.")
+            gd_folder_id = st.text_input(
+                "Folder ID",
+                value=gd_saved_folder,
+                help="Change the folder ID if needed, or use the saved default.",
+                key="gd_input_folder",
+            )
 
-            def gd_progress(current, total, filename):
-                progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
-                status.caption(f"Downloading: {filename}")
+            if st.button("Fetch & Categorize", type="primary", disabled=(not gd_folder_id.strip()), use_container_width=True, key="btn_gdrive_input"):
+                progress = st.progress(0, text="Downloading from Google Drive...")
+                status = st.empty()
 
-            try:
-                files_map = list_and_download_gdrive(creds_json, gd_folder_id.strip(), gd_progress)
-                progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
-                status.empty()
-                if not files_map:
-                    st.warning("No PDF files found in the folder.")
+                def gd_progress(current, total, filename):
+                    progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
+                    status.caption(f"Downloading: {filename}")
+
+                try:
+                    files_map = list_and_download_gdrive(gd_saved_creds, gd_folder_id.strip(), gd_progress)
+                    progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
+                    status.empty()
+                    if not files_map:
+                        st.warning("No PDF files found in the folder.")
+                        files_map = None
+                except Exception as e:
+                    st.error(f"Google Drive error: {e}")
                     files_map = None
-            except Exception as e:
-                st.error(f"Google Drive error: {e}")
-                files_map = None
+        else:
+            st.info("**One-time setup** — upload your service account key. It will be saved for next time.")
+            gd_creds = st.file_uploader(
+                "Service Account JSON Key",
+                type=["json"],
+                help="Upload your Google Cloud service account JSON key file.",
+                key="gd_input_creds",
+            )
+            gd_folder_id = st.text_input(
+                "Folder ID",
+                placeholder="e.g. 1AbCdEfGhIjKlMnOpQrStUvWxYz",
+                help="The folder ID from the Google Drive URL (after /folders/).",
+                key="gd_input_folder_setup",
+            )
+
+            gd_ready = gd_creds is not None and gd_folder_id.strip() != ""
+            if st.button("Fetch & Categorize", type="primary", disabled=(not gd_ready), use_container_width=True, key="btn_gdrive_input"):
+                try:
+                    creds_json = json.loads(gd_creds.read())
+                except Exception:
+                    st.error("Invalid JSON key file.")
+                    st.stop()
+
+                # Show how to save permanently
+                secrets_toml = f'[gdrive]\nfolder_id = "{gd_folder_id.strip()}"\n\n[gdrive.credentials]\n'
+                for k, v in creds_json.items():
+                    if isinstance(v, str):
+                        secrets_toml += f'{k} = """{v}"""\n'
+                    else:
+                        secrets_toml += f"{k} = {json.dumps(v)}\n"
+
+                with st.expander("Save config permanently", expanded=True):
+                    st.markdown("Go to your Streamlit Cloud app > **Settings** > **Secrets** and paste this:")
+                    st.code(secrets_toml, language="toml")
+
+                progress = st.progress(0, text="Downloading from Google Drive...")
+                status = st.empty()
+
+                def gd_progress(current, total, filename):
+                    progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
+                    status.caption(f"Downloading: {filename}")
+
+                try:
+                    files_map = list_and_download_gdrive(creds_json, gd_folder_id.strip(), gd_progress)
+                    progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
+                    status.empty()
+                    if not files_map:
+                        st.warning("No PDF files found in the folder.")
+                        files_map = None
+                except Exception as e:
+                    st.error(f"Google Drive error: {e}")
+                    files_map = None
 
     with tab_onedrive:
         st.caption("Download invoices from a OneDrive / SharePoint folder.")
