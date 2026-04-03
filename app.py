@@ -1,3 +1,4 @@
+import io
 import os
 import glob
 
@@ -284,10 +285,10 @@ else:
 
     with tab_upload:
         uploaded_files = st.file_uploader(
-            "Upload invoice PDFs",
-            type=["pdf"],
+            "Upload invoice PDFs or a ZIP file",
+            type=["pdf", "zip"],
             accept_multiple_files=True,
-            help="Select PDF invoice files. Max total upload: 1 GB.",
+            help="Select PDF files, or upload a ZIP containing PDFs. Max: 1 GB.",
         )
 
         if uploaded_files:
@@ -296,12 +297,32 @@ else:
                 size_str = f"{total_size / (1024 * 1024):.1f} MB"
             else:
                 size_str = f"{total_size / 1024:.0f} KB"
-            st.info(f"**{len(uploaded_files):,}** file{'s' if len(uploaded_files) != 1 else ''} selected ({size_str})")
+            zip_count = sum(1 for f in uploaded_files if f.name.lower().endswith('.zip'))
+            pdf_count = len(uploaded_files) - zip_count
+            parts = []
+            if pdf_count:
+                parts.append(f"{pdf_count:,} PDF{'s' if pdf_count != 1 else ''}")
+            if zip_count:
+                parts.append(f"{zip_count:,} ZIP{'s' if zip_count != 1 else ''}")
+            st.info(f"**{' + '.join(parts)}** selected ({size_str})")
 
         if st.button("Categorize Invoices", type="primary", disabled=(not uploaded_files), use_container_width=True, key="btn_upload"):
+            import zipfile
             files_map = {}
             for f in uploaded_files:
-                files_map[f.name] = f.read()
+                if f.name.lower().endswith('.zip'):
+                    # Extract PDFs from ZIP
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(f.read())) as zf:
+                            for name in zf.namelist():
+                                if name.lower().endswith('.pdf') and not name.startswith('__MACOSX'):
+                                    basename = os.path.basename(name)
+                                    if basename:
+                                        files_map[basename] = zf.read(name)
+                    except zipfile.BadZipFile:
+                        st.error(f"Could not read ZIP file: {f.name}")
+                else:
+                    files_map[f.name] = f.read()
 
     if tab_folder:
         with tab_folder:
