@@ -2,3 +2,5 @@ streamlit>=1.30.0
 PyMuPDF>=1.23.0
 pandas
 requests
+google-api-python-client
+google-auth

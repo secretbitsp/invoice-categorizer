@@ -67,7 +67,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Init Session State ---
-for key in ['processing_complete', 'results', 'summary', 'zip_bytes']:
+for key in ['processing_complete', 'results', 'summary', 'zip_bytes', 'files_map']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -107,29 +107,116 @@ if st.session_state.processing_complete:
         with st.expander(f"Errors ({summary['error_count']} files)"):
             st.dataframe(pd.DataFrame(summary['errors']), use_container_width=True, hide_index=True)
 
-    # Download
+    # Output
     if summary['ok_count'] == 0:
         st.warning("No original invoices found. All files were either duplicates or could not be processed.")
     else:
         st.divider()
-        zip_size = len(st.session_state.zip_bytes)
-        if zip_size > 1024 * 1024:
-            size_str = f"{zip_size / (1024 * 1024):.1f} MB"
-        else:
-            size_str = f"{zip_size / 1024:.0f} KB"
+        st.subheader("Get Results")
+        dl_tab, gdrive_tab = st.tabs(["Download ZIP", "Upload to Google Drive"])
 
-        st.download_button(
-            label=f"Download Categorized Invoices ({size_str})",
-            data=st.session_state.zip_bytes,
-            file_name="categorized_invoices.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        with dl_tab:
+            zip_size = len(st.session_state.zip_bytes)
+            if zip_size > 1024 * 1024:
+                size_str = f"{zip_size / (1024 * 1024):.1f} MB"
+            else:
+                size_str = f"{zip_size / 1024:.0f} KB"
+
+            st.download_button(
+                label=f"Download Categorized Invoices ({size_str})",
+                data=st.session_state.zip_bytes,
+                file_name="categorized_invoices.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
+        with gdrive_tab:
+            import json
+            from gdrive_uploader import upload_to_drive
+
+            # Check if credentials are saved in secrets
+            has_saved = False
+            saved_creds = None
+            saved_folder = ""
+            try:
+                saved_creds = dict(st.secrets["gdrive"]["credentials"])
+                saved_folder = st.secrets["gdrive"].get("folder_id", "")
+                has_saved = True
+            except Exception:
+                pass
+
+            if has_saved:
+                st.success("Google Drive is connected.")
+                if st.button("Upload to Google Drive", type="primary", use_container_width=True, key="btn_gdrive_up"):
+                    ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
+                    progress = st.progress(0, text="Uploading to Google Drive...")
+                    status = st.empty()
+
+                    def up_progress(current, total, filename):
+                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
+                        status.caption(f"Uploading: {filename}")
+
+                    try:
+                        result = upload_to_drive(
+                            credentials_json=saved_creds,
+                            parent_folder_id=saved_folder,
+                            ok_results=ok_results,
+                            uploaded_files=st.session_state.get('files_map', {}),
+                            progress_callback=up_progress,
+                        )
+                        progress.progress(1.0, text="Upload complete!")
+                        status.empty()
+                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
+            else:
+                st.info("**One-time setup** — after this, it's one click every time.")
+                creds_file = st.file_uploader("Service Account JSON Key", type=["json"], key="gdrive_creds")
+                folder_id = st.text_input("Google Drive Folder ID", placeholder="from the folder URL after /folders/")
+
+                if st.button("Save & Upload", type="primary", disabled=(creds_file is None or not folder_id.strip()), use_container_width=True, key="btn_gdrive_up"):
+                    try:
+                        creds_json = json.loads(creds_file.read())
+                    except Exception:
+                        st.error("Invalid JSON key file.")
+                        st.stop()
+
+                    # Generate secrets config for permanent saving
+                    secrets_toml = f'[gdrive]\nfolder_id = "{folder_id.strip()}"\n\n[gdrive.credentials]\n'
+                    for k, v in creds_json.items():
+                        secrets_toml += f'{k} = """{v}"""\n' if isinstance(v, str) else f"{k} = {json.dumps(v)}\n"
+
+                    with st.expander("Save this so you never have to do it again", expanded=True):
+                        st.markdown("Go to **Streamlit Cloud** > your app > **Settings** > **Secrets** and paste:")
+                        st.code(secrets_toml, language="toml")
+
+                    # Upload now
+                    ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
+                    progress = st.progress(0, text="Uploading to Google Drive...")
+                    status = st.empty()
+
+                    def up_progress_first(current, total, filename):
+                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
+                        status.caption(f"Uploading: {filename}")
+
+                    try:
+                        result = upload_to_drive(
+                            credentials_json=creds_json,
+                            parent_folder_id=folder_id.strip(),
+                            ok_results=ok_results,
+                            uploaded_files=st.session_state.get('files_map', {}),
+                            progress_callback=up_progress_first,
+                        )
+                        progress.progress(1.0, text="Upload complete!")
+                        status.empty()
+                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
 
     # Reset
     st.markdown("")
     if st.button("Process New Batch", use_container_width=True):
-        for key in ['processing_complete', 'results', 'summary', 'zip_bytes']:
+        for key in ['processing_complete', 'results', 'summary', 'zip_bytes', 'files_map']:
             st.session_state[key] = None
         st.rerun()
 
@@ -309,6 +396,7 @@ else:
         st.session_state.results = results
         st.session_state.summary = summary
         st.session_state.zip_bytes = zip_bytes
+        st.session_state.files_map = files_map
         st.session_state.processing_complete = True
 
         st.rerun()
