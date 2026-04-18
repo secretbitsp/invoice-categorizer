@@ -7,7 +7,6 @@ import requests
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
-import msal
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +180,13 @@ def list_and_download_onedrive(client_id: str, client_secret: str, tenant_id: st
     Returns:
         dict of {filename: bytes}
     """
+    try:
+        import msal
+    except ImportError as e:
+        raise ImportError(
+            "Install the msal package for authenticated OneDrive/Graph access: pip install msal"
+        ) from e
+
     # Authenticate
     authority = f"https://login.microsoftonline.com/{tenant_id}"
     app = msal.ConfidentialClientApplication(

@@ -4,3 +4,4 @@ pandas
 requests
 google-api-python-client
 google-auth
+msal>=1.24.0
