@@ -2,8 +2,10 @@
 Download PDF invoices from Google Drive or OneDrive folders.
 """
 
+import base64
 import io
 import requests
+from urllib.parse import parse_qs, urlparse
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
@@ -255,18 +257,47 @@ def _list_onedrive_pdfs(headers, folder_path, pdf_files):
         url = data.get('@odata.nextLink')
 
 
+def _normalize_onedrive_share_url(share_url: str) -> str:
+    """
+    Resolve consumer OneDrive wrapper links to the real share URL.
+
+    Copying from the browser often yields onedrive.live.com/?redeem=<base64>
+    where the payload decodes to https://1drv.ms/... . The OneDrive sharing
+    API token must be built from that inner URL, not the wrapper.
+    """
+    share_url = share_url.strip()
+    parsed = urlparse(share_url)
+    if "onedrive.live.com" not in (parsed.netloc or "").lower():
+        return share_url
+
+    qs = parse_qs(parsed.query)
+    redeem = (qs.get("redeem") or [None])[0]
+    if not redeem:
+        return share_url
+
+    try:
+        padded = redeem + "=" * (-len(redeem) % 4)
+        inner = base64.b64decode(padded).decode("utf-8").strip()
+        if inner.startswith("http"):
+            return inner
+    except Exception:
+        pass
+
+    return share_url
+
+
 def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     """
     Download all PDFs from a OneDrive sharing link (no auth needed for public links).
 
     Args:
-        share_url: OneDrive/SharePoint sharing URL
+        share_url: OneDrive/SharePoint sharing URL (1drv.ms, onedrive.live.com/?redeem=..., etc.)
         progress_callback: fn(current, total, filename)
 
     Returns:
         dict of {filename: bytes}
     """
-    import base64
+    share_url = _normalize_onedrive_share_url(share_url)
 
     # Encode sharing URL for the API
     encoded = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip('=')
