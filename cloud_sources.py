@@ -5,10 +5,19 @@ Download PDF invoices from Google Drive or OneDrive folders.
 import base64
 import io
 import requests
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
+
+# Browser-like headers; some OneDrive endpoints reject anonymous share calls without a UA.
+_CONSUMER_ONEDRIVE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +316,51 @@ def _raise_if_onedrive_address_bar_url(share_url: str) -> None:
         )
 
 
+def _onedrive_share_encoding_candidates(share_url: str) -> list[str]:
+    """
+    Build URL strings to feed into the u!{base64url} share token.
+
+    Short links (1drv.ms) redirect to onedrive.live.com/redir?resid=...&cid=...
+    Microsoft's examples often use that redir URL for encoding; trying both
+    improves compatibility with personal OneDrive / migrated folders.
+    """
+    share_url = share_url.strip()
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(u: str) -> None:
+        u = u.strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    add(share_url)
+
+    host = (urlparse(share_url).netloc or "").lower()
+    if "1drv.ms" not in host and "1drv.st" not in host:
+        return out
+
+    try:
+        r = requests.head(
+            share_url,
+            allow_redirects=False,
+            headers=_CONSUMER_ONEDRIVE_HEADERS,
+            timeout=30,
+        )
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location") or r.headers.get("location")
+            if loc:
+                expanded = urljoin(share_url, loc)
+                p = urlparse(expanded)
+                h = (p.netloc or "").lower()
+                if "onedrive.live.com" in h and "redir" in ((p.path or "") + "?" + (p.query or "")):
+                    add(expanded)
+    except Exception:
+        pass
+
+    return out
+
+
 def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     """
     Download all PDFs from a OneDrive sharing link (no auth needed for public links).
@@ -321,15 +375,25 @@ def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     share_url = _normalize_onedrive_share_url(share_url)
     _raise_if_onedrive_address_bar_url(share_url)
 
-    # Encode sharing URL for the API
-    encoded = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip('=')
-    token = 'u!' + encoded
+    last_error: Exception | None = None
+    pdf_files: list[tuple[str, str]] = []
 
-    api_base = f"https://api.onedrive.com/v1.0/shares/{token}"
+    for candidate in _onedrive_share_encoding_candidates(share_url):
+        encoded = base64.urlsafe_b64encode(candidate.encode()).decode().rstrip('=')
+        token = 'u!' + encoded
+        api_base = f"https://api.onedrive.com/v1.0/shares/{token}"
+        try:
+            batch: list[tuple[str, str]] = []
+            _list_share_pdfs(api_base, "/root/children", batch)
+            pdf_files = batch
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            continue
 
-    # List children
-    pdf_files = []
-    _list_share_pdfs(api_base, "/root/children", pdf_files)
+    if last_error is not None:
+        raise last_error
 
     if not pdf_files:
         return {}
@@ -338,7 +402,11 @@ def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     result = {}
 
     for i, (download_url, filename) in enumerate(pdf_files):
-        resp = requests.get(download_url)
+        resp = requests.get(
+            download_url,
+            headers=_CONSUMER_ONEDRIVE_HEADERS,
+            timeout=120,
+        )
         resp.raise_for_status()
         result[filename] = resp.content
 
@@ -351,7 +419,12 @@ def list_and_download_onedrive_link(share_url: str, progress_callback=None):
 def _list_share_pdfs(api_base, path, pdf_files):
     """List PDFs from a OneDrive sharing link."""
     url = api_base + path
-    resp = requests.get(url, params={"$top": "999"})
+    resp = requests.get(
+        url,
+        params={"$top": "999"},
+        headers=_CONSUMER_ONEDRIVE_HEADERS,
+        timeout=60,
+    )
 
     if resp.status_code != 200:
         err_body = resp.text
@@ -360,10 +433,17 @@ def _list_share_pdfs(api_base, path, pdf_files):
         except Exception:
             pass
         hint = ""
-        if "UnauthenticatedVroomException" in str(err_body):
+        err_s = str(err_body)
+        if "UnauthenticatedVroomException" in err_s or err_s.strip() == "Unauthenticated":
             hint = (
-                " If you used a link from the browser address bar (onedrive.live.com/?id=…), "
-                "use Share → Copy link to get a https://1drv.ms/… URL instead."
+                " Microsoft often returns this if the link is not really “Anyone with the link”, "
+                "the link expired, or the folder was moved. "
+                "Try creating a fresh Share link, or use Upload Files / a public Google Drive folder instead."
+            )
+        if "UnauthenticatedVroomException" in err_s:
+            hint += (
+                " If you used onedrive.live.com/?id=… from the address bar, use Share → Copy link "
+                "(https://1drv.ms/… or redeem=…) instead."
             )
         raise Exception(
             f"Cannot access shared folder. Make sure the link is set to "
@@ -385,7 +465,7 @@ def _list_share_pdfs(api_base, path, pdf_files):
     next_link = data.get('@odata.nextLink')
     if next_link:
         # For pagination, use the full URL
-        resp2 = requests.get(next_link)
+        resp2 = requests.get(next_link, headers=_CONSUMER_ONEDRIVE_HEADERS, timeout=60)
         if resp2.status_code == 200:
             data2 = resp2.json()
             for item in data2.get('value', []):
