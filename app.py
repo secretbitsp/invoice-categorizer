@@ -347,8 +347,9 @@ else:
     with tab_onedrive:
         od_link = st.text_input(
             "OneDrive Sharing Link",
-            placeholder="https://1drv.ms/f/... or https://onedrive.live.com/...",
-            help="Paste the sharing link. Must be set to 'Anyone with the link can view'.",
+            placeholder="https://1drv.ms/f/...  (from Share → Copy link, not the address bar)",
+            help="Use Share → Anyone with the link can view → Copy link. The URL must start with https://1drv.ms/ "
+            "or be a onedrive.live.com link that contains redeem=. Address-bar links (?id=…) will not work.",
         )
 
         if st.button("Fetch & Categorize", type="primary", disabled=(not od_link.strip() if od_link else True), use_container_width=True, key="btn_onedrive"):

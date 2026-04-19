@@ -286,6 +286,27 @@ def _normalize_onedrive_share_url(share_url: str) -> str:
     return share_url
 
 
+def _raise_if_onedrive_address_bar_url(share_url: str) -> None:
+    """
+    onedrive.live.com/?id=...&cid=... is the signed-in web app URL, not an
+    anonymous sharing link. Encoding it produces UnauthenticatedVroomException.
+    """
+    parsed = urlparse(share_url.strip())
+    if "onedrive.live.com" not in (parsed.netloc or "").lower():
+        return
+    qs = parse_qs(parsed.query)
+    if qs.get("redeem"):
+        return
+    if qs.get("id"):
+        raise ValueError(
+            "That OneDrive URL is from the browser address bar (?id=…), not a sharing link. "
+            "The app cannot open it without your Microsoft login.\n\n"
+            "Use this instead: open the folder in OneDrive → Share → "
+            "“Anyone with the link can view” → Copy link → paste the URL that starts with "
+            "https://1drv.ms/ (or paste the long onedrive.live.com link that includes redeem=…)."
+        )
+
+
 def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     """
     Download all PDFs from a OneDrive sharing link (no auth needed for public links).
@@ -298,6 +319,7 @@ def list_and_download_onedrive_link(share_url: str, progress_callback=None):
         dict of {filename: bytes}
     """
     share_url = _normalize_onedrive_share_url(share_url)
+    _raise_if_onedrive_address_bar_url(share_url)
 
     # Encode sharing URL for the API
     encoded = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip('=')
@@ -332,10 +354,20 @@ def _list_share_pdfs(api_base, path, pdf_files):
     resp = requests.get(url, params={"$top": "999"})
 
     if resp.status_code != 200:
+        err_body = resp.text
+        try:
+            err_body = resp.json().get("error", {}).get("message", err_body)
+        except Exception:
+            pass
+        hint = ""
+        if "UnauthenticatedVroomException" in str(err_body):
+            hint = (
+                " If you used a link from the browser address bar (onedrive.live.com/?id=…), "
+                "use Share → Copy link to get a https://1drv.ms/… URL instead."
+            )
         raise Exception(
-            f"Cannot access shared folder. "
-            f"Make sure the link is set to 'Anyone with the link can view'. "
-            f"Error: {resp.json().get('error', {}).get('message', resp.text)}"
+            f"Cannot access shared folder. Make sure the link is set to "
+            f"'Anyone with the link can view'. Error: {err_body}{hint}"
         )
 
     data = resp.json()
