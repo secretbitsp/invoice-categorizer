@@ -67,9 +67,115 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Init Session State ---
-for key in ['processing_complete', 'results', 'summary', 'zip_bytes', 'files_map']:
+for key in [
+    'processing_complete', 'results', 'summary', 'zip_bytes', 'files_map',
+    'onedrive_msal_flow', 'onedrive_auth', 'onedrive_expires_at',
+]:
     if key not in st.session_state:
         st.session_state[key] = None
+
+
+def _query_params_plain() -> dict:
+    qp = st.query_params
+    out = {}
+    for k in qp.keys():
+        v = qp[k]
+        if isinstance(v, list) and v:
+            out[k] = str(v[0])
+        elif v is not None:
+            out[k] = str(v)
+    return out
+
+
+def _clear_oauth_query_params():
+    for k in ("code", "state", "session_state", "error", "error_description"):
+        try:
+            if k in st.query_params:
+                del st.query_params[k]
+        except Exception:
+            pass
+
+
+def _maybe_complete_onedrive_oauth():
+    qp = _query_params_plain()
+    if qp.get("error"):
+        st.session_state["onedrive_msal_flow"] = None
+        if qp.get("error") == "access_denied":
+            st.session_state["_onedrive_oauth_flash"] = (
+                "warning", "Microsoft sign-in was cancelled."
+            )
+        else:
+            st.session_state["_onedrive_oauth_flash"] = (
+                "error",
+                qp.get("error_description")
+                or qp.get("error")
+                or "Microsoft sign-in failed.",
+            )
+        _clear_oauth_query_params()
+        st.rerun()
+
+    if "code" not in qp:
+        return
+
+    flow = st.session_state.get("onedrive_msal_flow")
+    if not flow:
+        st.session_state["_onedrive_oauth_flash"] = (
+            "warning",
+            "Sign-in session expired. Open the Microsoft sign-in tab and try again.",
+        )
+        _clear_oauth_query_params()
+        st.rerun()
+
+    try:
+        cfg = dict(st.secrets["azure_ad"])
+    except Exception:
+        st.session_state["_onedrive_oauth_flash"] = (
+            "error",
+            "Streamlit secrets are missing an [azure_ad] block. See the Microsoft sign-in tab for setup.",
+        )
+        _clear_oauth_query_params()
+        st.rerun()
+
+    from onedrive_oauth import acquire_token_from_auth_response, build_msal_app
+
+    app = build_msal_app(cfg)
+    result = acquire_token_from_auth_response(app, flow, qp)
+    st.session_state["onedrive_msal_flow"] = None
+
+    if "access_token" in result:
+        import time
+        st.session_state["onedrive_auth"] = result
+        st.session_state["onedrive_expires_at"] = time.time() + int(
+            result.get("expires_in", 3600)
+        )
+        st.session_state["_onedrive_oauth_flash"] = (
+            "success",
+            "Signed in with Microsoft. You can fetch your OneDrive folder below.",
+        )
+        _clear_oauth_query_params()
+        st.rerun()
+
+    st.session_state["_onedrive_oauth_flash"] = (
+        "error",
+        result.get("error_description")
+        or result.get("error")
+        or "Could not complete Microsoft sign-in.",
+    )
+    _clear_oauth_query_params()
+    st.rerun()
+
+
+_maybe_complete_onedrive_oauth()
+
+_flash = st.session_state.pop("_onedrive_oauth_flash", None)
+if _flash:
+    _fk, _fm = _flash
+    if _fk == "success":
+        st.success(_fm)
+    elif _fk == "warning":
+        st.warning(_fm)
+    else:
+        st.error(_fm)
 
 # --- Results Section ---
 if st.session_state.processing_complete:
@@ -345,33 +451,182 @@ else:
 
     # --- OneDrive ---
     with tab_onedrive:
-        od_link = st.text_input(
-            "OneDrive Sharing Link",
-            placeholder="https://1drv.ms/f/...  (from Share → Copy link, not the address bar)",
-            help="Use Share → Anyone with the link can view → Copy link. The URL must start with https://1drv.ms/ "
-            "or be a onedrive.live.com link that contains redeem=. Address-bar links (?id=…) will not work.",
+        sub_od_public, sub_od_ms = st.tabs(
+            ["Public link (no sign-in)", "Microsoft sign-in (recommended)"]
         )
 
-        if st.button("Fetch & Categorize", type="primary", disabled=(not od_link.strip() if od_link else True), use_container_width=True, key="btn_onedrive"):
-            from cloud_sources import list_and_download_onedrive_link
+        with sub_od_public:
+            st.caption(
+                "No Microsoft account needed. Does **not** work for OneDrive folders on accounts "
+                "migrated to SharePoint (`migratedtospo`). Use **Microsoft sign-in** for those."
+            )
+            od_link_pub = st.text_input(
+                "OneDrive sharing link",
+                placeholder="https://1drv.ms/f/...  (Share → Copy link, not the address bar)",
+                help="Use Share → Anyone with the link can view → Copy link. Must be https://1drv.ms/… "
+                "or onedrive.live.com with redeem=. Address-bar links (?id=…) will not work.",
+                key="od_link_public",
+            )
 
-            progress = st.progress(0, text="Downloading from OneDrive...")
-            status = st.empty()
+            if st.button(
+                "Fetch & Categorize",
+                type="primary",
+                disabled=(not od_link_pub.strip() if od_link_pub else True),
+                use_container_width=True,
+                key="btn_onedrive_public",
+            ):
+                from cloud_sources import list_and_download_onedrive_link
 
-            def od_progress(current, total, filename):
-                progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
-                status.caption(f"Downloading: {filename}")
+                progress = st.progress(0, text="Downloading from OneDrive...")
+                status = st.empty()
+
+                def od_progress_pub(current, total, filename):
+                    progress.progress(current / total, text=f"Downloading {current:,} / {total:,}")
+                    status.caption(f"Downloading: {filename}")
+
+                try:
+                    files_map = list_and_download_onedrive_link(od_link_pub.strip(), od_progress_pub)
+                    progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
+                    status.empty()
+                    if not files_map:
+                        st.warning("No PDF files found. Make sure the link is a public sharing link.")
+                        files_map = None
+                except Exception as e:
+                    st.error(f"OneDrive error: {e}")
+                    files_map = None
+
+        with sub_od_ms:
+            st.caption(
+                "Sign in with the **same kind of Microsoft account** you use to open the folder in the browser. "
+                "Then paste the usual Share → Copy link (`https://1drv.ms/…` or long `redeem=` URL)."
+            )
 
             try:
-                files_map = list_and_download_onedrive_link(od_link.strip(), od_progress)
-                progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
-                status.empty()
-                if not files_map:
-                    st.warning("No PDF files found. Make sure the link is a public sharing link.")
-                    files_map = None
-            except Exception as e:
-                st.error(f"OneDrive error: {e}")
-                files_map = None
+                az_cfg = dict(st.secrets["azure_ad"])
+            except Exception:
+                az_cfg = None
+
+            if not az_cfg:
+                st.info(
+                    "To enable Microsoft sign-in, add an **[azure_ad]** section to **Streamlit Cloud → "
+                    "Settings → Secrets** (or `.streamlit/secrets.toml` locally)."
+                )
+                with st.expander("Azure app registration (one-time setup)"):
+                    st.markdown(
+                        """
+1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**.
+2. **Supported account types:** *Accounts in any organizational directory and personal Microsoft accounts* (multi-tenant + personal).
+3. **Authentication** → **Web** → **Redirect URIs** (must match **exactly**, including trailing slash):
+   - `https://YOUR-APP.streamlit.app/`
+   - `http://localhost:8501/` for local runs.
+4. **Certificates & secrets** → New **client secret**.
+5. **API permissions** → **Microsoft Graph** → **Delegated** → add **Files.Read.All**, **User.Read**, **offline_access** (OpenID permissions often include User.Read; add **offline_access** explicitly).
+6. In **Secrets**, set:
+
+```toml
+[azure_ad]
+client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+client_secret = "your-client-secret"
+tenant_id = "common"
+redirect_uri = "https://YOUR-APP.streamlit.app/"
+```
+
+Use `tenant_id = "consumers"` if you only want personal Microsoft accounts (not work/school).
+
+**Optional:** omit `client_secret` and register the app as a **public client** with the same redirect URIs under **Mobile and desktop applications** (advanced).
+                        """
+                    )
+            else:
+                rid = (az_cfg.get("redirect_uri") or "").strip()
+                if not rid:
+                    st.error("`azure_ad.redirect_uri` is required in Secrets (must match Azure exactly).")
+                else:
+                    auth = st.session_state.get("onedrive_auth")
+                    exp = st.session_state.get("onedrive_expires_at")
+
+                    if auth and auth.get("access_token"):
+                        idc = auth.get("id_token_claims") or {}
+                        who = idc.get("preferred_username") or idc.get("email") or "Microsoft user"
+                        st.success(f"Signed in as **{who}**")
+                        if st.button("Sign out from Microsoft", key="btn_od_signout"):
+                            st.session_state["onedrive_auth"] = None
+                            st.session_state["onedrive_expires_at"] = None
+                            st.session_state["onedrive_msal_flow"] = None
+                            st.rerun()
+                    else:
+                        if st.button("Prepare Microsoft sign-in", type="primary", key="btn_od_prepare"):
+                            from onedrive_oauth import build_msal_app, start_auth_code_flow
+
+                            app = build_msal_app(az_cfg)
+                            st.session_state["onedrive_msal_flow"] = start_auth_code_flow(
+                                app, rid
+                            )
+                            st.rerun()
+
+                        flow = st.session_state.get("onedrive_msal_flow")
+                        if flow:
+                            st.link_button(
+                                "Open Microsoft sign-in page →",
+                                flow["auth_uri"],
+                                use_container_width=True,
+                                type="primary",
+                                help="Complete login in the browser; you will be sent back to this app.",
+                            )
+                            st.caption("After Microsoft redirects you back here, the app finishes sign-in automatically.")
+
+                    if auth and auth.get("access_token"):
+                        od_link_ms = st.text_input(
+                            "OneDrive sharing link",
+                            placeholder="https://1drv.ms/f/...",
+                            key="od_link_ms",
+                        )
+                        if st.button(
+                            "Fetch & Categorize (signed in)",
+                            type="primary",
+                            disabled=(not od_link_ms.strip() if od_link_ms else True),
+                            use_container_width=True,
+                            key="btn_onedrive_ms",
+                        ):
+                            from onedrive_oauth import (
+                                download_shared_folder_via_graph,
+                                get_valid_access_token,
+                            )
+
+                            progress = st.progress(0, text="Downloading from OneDrive via Microsoft Graph...")
+                            status = st.empty()
+
+                            def od_progress_ms(current, total, filename):
+                                progress.progress(
+                                    current / max(total, 1),
+                                    text=f"Downloading {current:,} / {total:,}",
+                                )
+                                status.caption(f"Downloading: {filename}")
+
+                            try:
+                                token, new_auth, new_exp = get_valid_access_token(
+                                    az_cfg, auth, exp
+                                )
+                                if not token:
+                                    st.error(
+                                        "Microsoft session expired. Sign out and sign in again."
+                                    )
+                                    files_map = None
+                                else:
+                                    if new_auth:
+                                        st.session_state["onedrive_auth"] = new_auth
+                                    if new_exp is not None:
+                                        st.session_state["onedrive_expires_at"] = new_exp
+                                    files_map = download_shared_folder_via_graph(
+                                        token, od_link_ms.strip(), od_progress_ms
+                                    )
+                                    progress.progress(1.0, text=f"Downloaded {len(files_map):,} PDFs")
+                                    status.empty()
+                                    if not files_map:
+                                        st.warning("No PDF files found in that folder.")
+                                        files_map = None
+                            except Exception as e:
+                                st.error(f"OneDrive (signed-in) error: {e}")
+                                files_map = None
 
     # --- Process ---
     if files_map:
