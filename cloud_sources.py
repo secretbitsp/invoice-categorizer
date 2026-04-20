@@ -5,7 +5,7 @@ Download PDF invoices from Google Drive or OneDrive folders.
 import base64
 import io
 import requests
-from urllib.parse import parse_qs, urlparse, urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
@@ -316,13 +316,59 @@ def _raise_if_onedrive_address_bar_url(share_url: str) -> None:
         )
 
 
+def _slim_onedrive_redir_url(url: str) -> str:
+    """
+    Strip bulky query params (redeem=...) from onedrive.live.com/redir URLs so
+    the base64-encoded share token does not exceed maxUrlLength.
+    """
+    p = urlparse(url)
+    q = parse_qs(p.query, keep_blank_values=True)
+    keep = {}
+    for k in ("resid", "cid", "ithint", "authkey", "e"):
+        if k in q and q[k]:
+            keep[k] = q[k][0]
+    return urlunparse(p._replace(query=urlencode(keep)))
+
+
+def _follow_short_redirect(share_url: str) -> tuple[str | None, bool]:
+    """
+    Return (redir_url_or_None, migrated_to_spo).
+
+    Resolves 1drv.ms short links once; detects the migratedtospo=true flag that
+    indicates the OneDrive account has been moved to SharePoint Online and is
+    unreachable via the anonymous consumer share API.
+    """
+    try:
+        r = requests.head(
+            share_url,
+            allow_redirects=False,
+            headers=_CONSUMER_ONEDRIVE_HEADERS,
+            timeout=30,
+        )
+    except Exception:
+        return None, False
+
+    if r.status_code not in (301, 302, 303, 307, 308):
+        return None, False
+
+    loc = r.headers.get("Location") or r.headers.get("location")
+    if not loc:
+        return None, False
+
+    expanded = urljoin(share_url, loc)
+    p = urlparse(expanded)
+    host = (p.netloc or "").lower()
+    if "onedrive.live.com" not in host:
+        return expanded, False
+
+    q = parse_qs(p.query)
+    migrated = (q.get("migratedtospo") or [""])[0].lower() == "true"
+    return expanded, migrated
+
+
 def _onedrive_share_encoding_candidates(share_url: str) -> list[str]:
     """
     Build URL strings to feed into the u!{base64url} share token.
-
-    Short links (1drv.ms) redirect to onedrive.live.com/redir?resid=...&cid=...
-    Microsoft's examples often use that redir URL for encoding; trying both
-    improves compatibility with personal OneDrive / migrated folders.
     """
     share_url = share_url.strip()
     seen: set[str] = set()
@@ -337,28 +383,18 @@ def _onedrive_share_encoding_candidates(share_url: str) -> list[str]:
     add(share_url)
 
     host = (urlparse(share_url).netloc or "").lower()
-    if "1drv.ms" not in host and "1drv.st" not in host:
-        return out
-
-    try:
-        r = requests.head(
-            share_url,
-            allow_redirects=False,
-            headers=_CONSUMER_ONEDRIVE_HEADERS,
-            timeout=30,
-        )
-        if r.status_code in (301, 302, 303, 307, 308):
-            loc = r.headers.get("Location") or r.headers.get("location")
-            if loc:
-                expanded = urljoin(share_url, loc)
-                p = urlparse(expanded)
-                h = (p.netloc or "").lower()
-                if "onedrive.live.com" in h and "redir" in ((p.path or "") + "?" + (p.query or "")):
-                    add(expanded)
-    except Exception:
-        pass
+    if "1drv.ms" in host or "1drv.st" in host:
+        expanded, _ = _follow_short_redirect(share_url)
+        if expanded and "onedrive.live.com" in (urlparse(expanded).netloc or "").lower():
+            add(_slim_onedrive_redir_url(expanded))
+            add(expanded)
 
     return out
+
+
+class OneDriveMigratedToSpoError(Exception):
+    """The shared folder has been migrated to SharePoint Online and the
+    anonymous consumer share API cannot reach it."""
 
 
 def list_and_download_onedrive_link(share_url: str, progress_callback=None):
@@ -374,6 +410,22 @@ def list_and_download_onedrive_link(share_url: str, progress_callback=None):
     """
     share_url = _normalize_onedrive_share_url(share_url)
     _raise_if_onedrive_address_bar_url(share_url)
+
+    host = (urlparse(share_url).netloc or "").lower()
+    if "1drv.ms" in host or "1drv.st" in host:
+        _, migrated = _follow_short_redirect(share_url)
+        if migrated:
+            raise OneDriveMigratedToSpoError(
+                "This OneDrive account has been migrated to SharePoint Online "
+                "(migratedtospo=true). Microsoft no longer allows anonymous, "
+                "public-link downloads for these folders — even when the link "
+                "is shared as “Anyone with the link can view.”\n\n"
+                "Please use one of these instead:\n"
+                "• Upload Files / ZIP in this app (always works), or\n"
+                "• Put the PDFs in a Google Drive folder shared as "
+                "“Anyone with the link can view” and use the Google Drive tab, or\n"
+                "• Ask a developer to add OneDrive OAuth sign-in to the app."
+            )
 
     last_error: Exception | None = None
     pdf_files: list[tuple[str, str]] = []
