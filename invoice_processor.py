@@ -42,6 +42,61 @@ CUSTOMER_CODE_MAP = {
 }
 
 
+def extract_invoice_number(text: str, filename: str) -> str | None:
+    """
+    Best-effort invoice number from page-1 text, then from Onia-style filenames
+    like 100000026_URBN_20260318.PDF (first numeric segment).
+    """
+    chunk = (text or "")[:8000]
+    if chunk:
+        patterns = [
+            r"Invoice\s*(?:No\.?|Number|#)\s*:?\s*(\d+)",
+            r"\bINV[#:\s\-]+(\d+)\b",
+            r"Document\s*(?:No\.?|Number|#)\s*:?\s*(\d+)",
+            r"Sales\s*Order\s*#?\s*:?\s*(\d+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, chunk, re.I)
+            if m:
+                num = m.group(1).strip()
+                if len(num) >= 4:
+                    return num
+    stem = os.path.basename(filename).replace(".PDF", "").replace(".pdf", "")
+    parts = stem.split("_")
+    if parts and parts[0].isdigit():
+        return parts[0]
+    return None
+
+
+def apply_invoice_number_dedupe(results: list[dict]) -> None:
+    """
+    For results with status 'ok' and the same invoice_number, keep one file
+    (first by source_path or filename) and mark the rest skipped_duplicate_invoice.
+    Rows with no invoice_number are left unchanged.
+    """
+    ok = [r for r in results if r.get("status") == "ok"]
+    by_num: dict[str, list[dict]] = defaultdict(list)
+    for r in ok:
+        num = r.get("invoice_number")
+        if num is None:
+            continue
+        s = str(num).strip()
+        if not s:
+            continue
+        by_num[s].append(r)
+
+    for group in by_num.values():
+        if len(group) <= 1:
+            continue
+
+        def sort_key(r: dict) -> str:
+            return (r.get("source_path") or r.get("filename") or "").lower()
+
+        group.sort(key=sort_key)
+        for dup in group[1:]:
+            dup["status"] = "skipped_duplicate_invoice"
+
+
 def clean_customer_name(raw_name: str) -> str:
     """Clean a raw BILL TO name into a safe folder name."""
     name = raw_name.strip()
@@ -119,12 +174,16 @@ def _extract_from_pdf(pdf_path: str) -> dict | None:
     if not customer_name:
         return None
 
+    basename = os.path.basename(pdf_path)
+    inv = extract_invoice_number(text, basename)
+
     return {
         "customer_raw": customer_name,
         "customer_clean": clean_customer_name(customer_name),
         "year": year,
         "month": month,
         "is_duplicate": "*** DUPLICATE ***" in text,
+        "invoice_number": inv,
         "source": "pdf",
     }
 
@@ -134,12 +193,14 @@ def _extract_from_filename(filename: str) -> dict | None:
     parts = filename.replace('.PDF', '').replace('.pdf', '').split('_')
     if len(parts) >= 2:
         code = parts[1]
+        inv = extract_invoice_number("", filename)
         return {
             "customer_raw": code,
             "customer_clean": CUSTOMER_CODE_MAP.get(code, code),
             "year": None,
             "month": None,
             "is_duplicate": False,
+            "invoice_number": inv,
             "source": "filename" if code in CUSTOMER_CODE_MAP else "filename_unknown",
         }
     return None
@@ -153,6 +214,7 @@ def process_single_file(pdf_bytes: bytes, filename: str, skip_duplicates: bool =
         "year": None,
         "month": None,
         "is_duplicate": False,
+        "invoice_number": None,
         "status": "error",
         "method": None,
         "error_message": None,
@@ -179,6 +241,8 @@ def process_single_file(pdf_bytes: bytes, filename: str, skip_duplicates: bool =
         except Exception:
             pass
 
+    result["invoice_number"] = data.get("invoice_number")
+
     if skip_duplicates and data.get("is_duplicate", False):
         result["status"] = "skipped_duplicate"
         result["method"] = data["source"]
@@ -197,6 +261,7 @@ def compute_summary(results: list[dict]) -> dict:
     """Compute summary statistics from processing results."""
     ok = [r for r in results if r["status"] == "ok"]
     duplicates = [r for r in results if r["status"] == "skipped_duplicate"]
+    dup_inv = [r for r in results if r["status"] == "skipped_duplicate_invoice"]
     errors = [r for r in results if r["status"] == "error"]
 
     customer_counts = defaultdict(int)
@@ -211,11 +276,20 @@ def compute_summary(results: list[dict]) -> dict:
     return {
         "total": len(results),
         "ok_count": len(ok),
-        "duplicate_count": len(duplicates),
+        "duplicate_count": len(duplicates) + len(dup_inv),
+        "duplicate_pdf_marker_count": len(duplicates),
+        "duplicate_invoice_number_count": len(dup_inv),
         "error_count": len(errors),
         "customer_counts": dict(sorted(customer_counts.items(), key=lambda x: -x[1])),
         "year_month_counts": dict(sorted(year_month_counts.items())),
         "errors": [{"File": r["filename"], "Error": r.get("error_message", "Unknown")} for r in errors],
+        "duplicate_invoice_rows": [
+            {
+                "File": r.get("filename"),
+                "Invoice #": r.get("invoice_number"),
+            }
+            for r in dup_inv
+        ],
     }
 
 

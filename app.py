@@ -5,7 +5,12 @@ import zipfile
 
 import streamlit as st
 import pandas as pd
-from invoice_processor import process_single_file, compute_summary, build_zip
+from invoice_processor import (
+    apply_invoice_number_dedupe,
+    build_zip,
+    compute_summary,
+    process_single_file,
+)
 
 # --- Page Config ---
 st.set_page_config(
@@ -188,6 +193,14 @@ if st.session_state.processing_complete:
     c3.metric("Duplicates", f"{summary['duplicate_count']:,}")
     c4.metric("Errors", f"{summary['error_count']:,}")
 
+    dpm = summary.get("duplicate_pdf_marker_count", 0)
+    din = summary.get("duplicate_invoice_number_count", 0)
+    if dpm or din:
+        st.caption(
+            f"Duplicate breakdown: **{dpm:,}** PDF marked with Onia duplicate stamp, "
+            f"**{din:,}** extra file(s) with the same invoice number."
+        )
+
     st.divider()
 
     # Customer breakdown
@@ -212,6 +225,11 @@ if st.session_state.processing_complete:
     if summary['error_count'] > 0:
         with st.expander(f"Errors ({summary['error_count']} files)"):
             st.dataframe(pd.DataFrame(summary['errors']), use_container_width=True, hide_index=True)
+
+    din_rows = summary.get("duplicate_invoice_rows") or []
+    if din_rows:
+        with st.expander(f"Skipped duplicate invoice numbers ({len(din_rows)} files)"):
+            st.dataframe(pd.DataFrame(din_rows), use_container_width=True, hide_index=True)
 
     # Output
     if summary['ok_count'] == 0:
@@ -328,8 +346,17 @@ if st.session_state.processing_complete:
 
 else:
     # --- Options ---
-    skip_duplicates = st.toggle("Skip duplicate invoices", value=True,
-                                help="Invoices marked as '*** DUPLICATE ***' will be skipped. Turn off to include all files.")
+    skip_duplicates = st.toggle(
+        "Skip PDFs marked “*** DUPLICATE ***”",
+        value=True,
+        help="Onia sometimes prints this on duplicate copies of the same invoice.",
+    )
+    dedupe_invoice_numbers = st.toggle(
+        "Deduplicate by invoice number",
+        value=True,
+        help="If two or more PDFs share the same invoice # (from the PDF text or filename like 100000026_URBN_…), "
+        "only the first file (alphabetically by name) is kept.",
+    )
 
     # --- Input Tabs ---
     is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("HOSTNAME", "").startswith("streamlit")
@@ -644,6 +671,9 @@ Use `tenant_id = "consumers"` if you only want personal Microsoft accounts (not 
 
         progress.progress(1.0, text="Complete!")
         status.empty()
+
+        if dedupe_invoice_numbers:
+            apply_invoice_number_dedupe(results)
 
         summary = compute_summary(results)
         ok_results = [r for r in results if r['status'] == 'ok']

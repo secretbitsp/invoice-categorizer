@@ -22,6 +22,8 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from invoice_processor import apply_invoice_number_dedupe, extract_invoice_number
+
 # OCR support (optional - used only if PDF has no extractable text)
 try:
     import pytesseract
@@ -145,6 +147,8 @@ def extract_invoice_data(pdf_path: str) -> dict | None:
 
     # --- Check for duplicate marker ---
     is_duplicate = "*** DUPLICATE ***" in text
+    basename = os.path.basename(pdf_path)
+    inv = extract_invoice_number(text, basename)
 
     return {
         "customer_raw": customer_name,
@@ -152,6 +156,7 @@ def extract_invoice_data(pdf_path: str) -> dict | None:
         "year": year,
         "month": month,
         "is_duplicate": is_duplicate,
+        "invoice_number": inv,
         "source": "pdf",
     }
 
@@ -162,12 +167,14 @@ def extract_from_filename(pdf_path: str) -> dict | None:
     parts = basename.replace('.PDF', '').replace('.pdf', '').split('_')
     if len(parts) >= 2:
         code = parts[1]
+        inv = extract_invoice_number("", basename)
         if code in CUSTOMER_CODE_MAP:
             return {
                 "customer_raw": code,
                 "customer_clean": CUSTOMER_CODE_MAP[code],
                 "year": None,
                 "month": None,
+                "invoice_number": inv,
                 "source": "filename",
             }
         else:
@@ -176,14 +183,15 @@ def extract_from_filename(pdf_path: str) -> dict | None:
                 "customer_clean": code,
                 "year": None,
                 "month": None,
+                "invoice_number": inv,
                 "source": "filename_unknown",
             }
     return None
 
 
 def process_single_invoice(args: tuple) -> dict:
-    """Process one PDF: extract data, determine destination, optionally copy."""
-    pdf_path, output_dir, do_copy = args
+    """Process one PDF: extract metadata and destination path (copy happens in main)."""
+    pdf_path, output_dir = args
     basename = os.path.basename(pdf_path)
     result = {
         "source_path": pdf_path,
@@ -191,6 +199,7 @@ def process_single_invoice(args: tuple) -> dict:
         "customer": None,
         "year": None,
         "month": None,
+        "invoice_number": None,
         "status": "error",
         "method": None,
     }
@@ -203,7 +212,9 @@ def process_single_invoice(args: tuple) -> dict:
             logging.error(f"FAILED completely: {pdf_path}")
             return result
 
-    # Skip duplicate invoices (only keep originals)
+    result["invoice_number"] = data.get("invoice_number")
+
+    # Skip PDFs marked *** DUPLICATE *** (Onia print copy)
     if data.get("is_duplicate", False):
         result["status"] = "skipped_duplicate"
         result["method"] = data["source"]
@@ -226,10 +237,6 @@ def process_single_invoice(args: tuple) -> dict:
     result["month"] = month
     result["method"] = data["source"]
 
-    if do_copy:
-        os.makedirs(dest_dir, exist_ok=True)
-        shutil.copy2(pdf_path, dest_path)
-
     result["status"] = "ok"
     return result
 
@@ -248,6 +255,7 @@ def generate_report(results: list[dict], output_dir: str, do_copy: bool):
     ok = [r for r in results if r["status"] == "ok"]
     errors = [r for r in results if r["status"] == "error"]
     duplicates = [r for r in results if r["status"] == "skipped_duplicate"]
+    dup_inv = [r for r in results if r["status"] == "skipped_duplicate_invoice"]
     fallbacks = [r for r in ok if r["method"] and r["method"].startswith("filename")]
 
     # Customer summary
@@ -268,7 +276,8 @@ def generate_report(results: list[dict], output_dir: str, do_copy: bool):
     print(f"{'='*60}")
     print(f"  Total processed:  {len(results)}")
     print(f"  Originals copied: {len(ok)}")
-    print(f"  Duplicates skip:  {len(duplicates)}")
+    print(f"  Duplicates skip:  {len(duplicates)} (PDF marked *** DUPLICATE ***)")
+    print(f"  Same invoice #: {len(dup_inv)} (extra files with same invoice number)")
     print(f"  Failed:           {len(errors)}")
     print(f"  Filename fallback:{len(fallbacks)}")
     print()
@@ -332,6 +341,8 @@ def main():
                         help="Actually copy files (default is dry run)")
     parser.add_argument("--workers", type=int, default=os.cpu_count(),
                         help="Parallel workers (default: CPU count)")
+    parser.add_argument("--no-invoice-dedupe", action="store_true",
+                        help="Keep all files even when invoice number repeats (default: dedupe)")
     args = parser.parse_args()
 
     # Discover PDFs
@@ -343,9 +354,8 @@ def main():
         print("No PDF files found. Check --input-dir path.")
         sys.exit(1)
 
-    # Process in parallel
     do_copy = args.run
-    tasks = [(pdf, args.output_dir, do_copy) for pdf in pdf_files]
+    tasks = [(pdf, args.output_dir) for pdf in pdf_files]
 
     results = []
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -359,10 +369,19 @@ def main():
                 results.append({
                     "source_path": pdf, "dest_path": None,
                     "customer": None, "year": None, "month": None,
+                    "invoice_number": None,
                     "status": "error", "method": None,
                 })
 
-    # Report
+    if not args.no_invoice_dedupe:
+        apply_invoice_number_dedupe(results)
+
+    if do_copy:
+        for r in results:
+            if r["status"] == "ok" and r.get("dest_path"):
+                os.makedirs(os.path.dirname(r["dest_path"]), exist_ok=True)
+                shutil.copy2(r["source_path"], r["dest_path"])
+
     generate_report(results, args.output_dir, do_copy)
 
 
