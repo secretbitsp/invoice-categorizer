@@ -44,9 +44,18 @@ CUSTOMER_CODE_MAP = {
 
 def extract_invoice_number(text: str, filename: str) -> str | None:
     """
-    Best-effort invoice number from page-1 text, then from Onia-style filenames
-    like 100000026_URBN_20260318.PDF (first numeric segment).
+    Best-effort invoice number. Prefer Onia-style filenames (NUMBER_CUSTOMER_…)
+    when present — avoids grabbing unrelated long numbers from PDF body text.
+    Otherwise use page-1 text (Invoice # / Document # patterns).
     """
+    stem = os.path.basename(filename).replace(".PDF", "").replace(".pdf", "")
+    parts = stem.split("_")
+    # 100000026_URBN_20260318.PDF — invoice is always the first segment
+    if len(parts) >= 2 and parts[0].isdigit():
+        return parts[0]
+    if len(parts) == 1 and parts[0].isdigit() and len(parts[0]) >= 6:
+        return parts[0]
+
     chunk = (text or "")[:8000]
     if chunk:
         patterns = [
@@ -61,10 +70,6 @@ def extract_invoice_number(text: str, filename: str) -> str | None:
                 num = m.group(1).strip()
                 if len(num) >= 4:
                     return num
-    stem = os.path.basename(filename).replace(".PDF", "").replace(".pdf", "")
-    parts = stem.split("_")
-    if parts and parts[0].isdigit():
-        return parts[0]
     return None
 
 
