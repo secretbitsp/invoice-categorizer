@@ -59,6 +59,8 @@ def extract_invoice_number(text: str, filename: str) -> str | None:
     chunk = (text or "")[:8000]
     if chunk:
         patterns = [
+            # Onia layout: NUMBER / MM/DD/YY / digits / INVOICE (see sample invoices)
+            r"(?m)^NUMBER\s*\n\s*\d{2}/\d{2}/\d{2}\s*\n\s*(\d+)\s*\n\s*INVOICE\b",
             r"Invoice\s*(?:No\.?|Number|#)\s*:?\s*(\d+)",
             r"\bINV[#:\s\-]+(\d+)\b",
             r"Document\s*(?:No\.?|Number|#)\s*:?\s*(\d+)",
@@ -132,8 +134,12 @@ def _ocr_page(pdf_path: str) -> str:
         return ""
 
 
-def _extract_from_pdf(pdf_path: str) -> dict | None:
-    """Extract customer name, date, and duplicate flag from page 1."""
+def _extract_from_pdf(pdf_path: str, original_filename: str | None = None) -> dict | None:
+    """Extract customer name, date, and duplicate flag from page 1.
+
+    original_filename: real upload name (e.g. 700000162_RUN001_….PDF). Required when
+    pdf_path is a tempfile — otherwise invoice numbers from the filename are lost.
+    """
     try:
         doc = fitz.open(pdf_path)
         text = doc.load_page(0).get_text()
@@ -179,8 +185,8 @@ def _extract_from_pdf(pdf_path: str) -> dict | None:
     if not customer_name:
         return None
 
-    basename = os.path.basename(pdf_path)
-    inv = extract_invoice_number(text, basename)
+    name_for_inv = original_filename or os.path.basename(pdf_path)
+    inv = extract_invoice_number(text, name_for_inv)
 
     return {
         "customer_raw": customer_name,
@@ -231,7 +237,7 @@ def process_single_file(pdf_bytes: bytes, filename: str, skip_duplicates: bool =
             tmp.write(pdf_bytes)
             tmp_path = tmp.name
 
-        data = _extract_from_pdf(tmp_path)
+        data = _extract_from_pdf(tmp_path, original_filename=filename)
         if data is None:
             data = _extract_from_filename(filename)
             if data is None:
