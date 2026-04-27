@@ -12,6 +12,50 @@ from invoice_processor import (
     process_single_file,
 )
 
+# Google Drive: client default root (categorized_invoices). Override with `[gdrive] folder_id` in secrets
+# or the GDRIVE_FOLDER_ID environment variable.
+GDRIVE_DEFAULT_FOLDER_ID = "1-ivSbgBMGZJwqZ2hp3r7jH4HkzEXjWe7"
+
+
+def _resolve_gdrive_config():
+    """
+    Read OAuth user credentials and destination folder from Streamlit secrets.
+
+    Required keys under [gdrive]: client_id, client_secret, refresh_token.
+    Optional: folder_id (defaults to GDRIVE_DEFAULT_FOLDER_ID).
+
+    Returns (oauth_config_dict | None, folder_id, source_label).
+    """
+    oauth_config = None
+    source = ""
+    try:
+        g = st.secrets["gdrive"]
+        cid = (g.get("client_id") or "").strip()
+        csec = (g.get("client_secret") or "").strip()
+        rtok = (g.get("refresh_token") or "").strip()
+        if cid and csec and rtok:
+            oauth_config = {
+                "client_id": cid,
+                "client_secret": csec,
+                "refresh_token": rtok,
+            }
+            source = "Streamlit secrets"
+    except Exception:
+        pass
+
+    folder = GDRIVE_DEFAULT_FOLDER_ID
+    try:
+        g = st.secrets["gdrive"]
+        f = (g.get("folder_id") or "").strip()
+        if f:
+            folder = f
+    except Exception:
+        pass
+    env_folder = (os.environ.get("GDRIVE_FOLDER_ID") or "").strip()
+    if env_folder:
+        folder = env_folder
+    return oauth_config, folder, source
+
 # --- Page Config ---
 st.set_page_config(
     page_title="Invoice Categorizer",
@@ -255,87 +299,59 @@ if st.session_state.processing_complete:
             )
 
         with gdrive_tab:
-            import json
             from gdrive_uploader import upload_to_drive
 
-            # Check if credentials are saved in secrets
-            has_saved = False
-            saved_creds = None
-            saved_folder = ""
-            try:
-                saved_creds = dict(st.secrets["gdrive"]["credentials"])
-                saved_folder = st.secrets["gdrive"].get("folder_id", "")
-                has_saved = True
-            except Exception:
-                pass
+            def gdrive_error_block(exc: Exception) -> None:
+                st.error(f"Upload failed: {exc}")
 
-            if has_saved:
+            def gdrive_success_block(result: dict) -> None:
+                up = int(result.get("uploaded", 0))
+                sk = int(result.get("skipped_existing", 0))
+                if sk:
+                    st.success(
+                        f"Uploaded **{up:,}** invoice file(s) to Google Drive. "
+                        f"Skipped **{sk:,}** that were already in the same folder (no duplicate files)."
+                    )
+                else:
+                    st.success(f"Uploaded **{up:,}** invoice file(s) to Google Drive.")
+
+            saved_oauth, saved_folder, creds_source = _resolve_gdrive_config()
+
+            if saved_oauth is not None:
                 st.success("Google Drive is connected.")
+                st.caption(f"Auth: {creds_source}")
                 if st.button("Upload to Google Drive", type="primary", use_container_width=True, key="btn_gdrive_up"):
                     ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
                     progress = st.progress(0, text="Uploading to Google Drive...")
                     status = st.empty()
 
                     def up_progress(current, total, filename):
-                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
+                        if total:
+                            progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
                         status.caption(f"Uploading: {filename}")
 
                     try:
                         result = upload_to_drive(
-                            credentials_json=saved_creds,
+                            oauth_config=saved_oauth,
                             parent_folder_id=saved_folder,
                             ok_results=ok_results,
                             uploaded_files=st.session_state.get('files_map', {}),
                             progress_callback=up_progress,
+                            skip_if_exists=True,
                         )
-                        progress.progress(1.0, text="Upload complete!")
+                        if ok_results:
+                            progress.progress(1.0, text="Upload complete!")
                         status.empty()
-                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
+                        gdrive_success_block(result)
                     except Exception as e:
-                        st.error(f"Upload failed: {e}")
+                        gdrive_error_block(e)
             else:
-                st.info("**One-time setup** — after this, it's one click every time.")
-                creds_file = st.file_uploader("Service Account JSON Key", type=["json"], key="gdrive_creds")
-                folder_id = st.text_input("Google Drive Folder ID", placeholder="from the folder URL after /folders/")
-
-                if st.button("Save & Upload", type="primary", disabled=(creds_file is None or not folder_id.strip()), use_container_width=True, key="btn_gdrive_up"):
-                    try:
-                        creds_json = json.loads(creds_file.read())
-                    except Exception:
-                        st.error("Invalid JSON key file.")
-                        st.stop()
-
-                    # Generate secrets config for permanent saving
-                    secrets_toml = f'[gdrive]\nfolder_id = "{folder_id.strip()}"\n\n[gdrive.credentials]\n'
-                    for k, v in creds_json.items():
-                        secrets_toml += f'{k} = """{v}"""\n' if isinstance(v, str) else f"{k} = {json.dumps(v)}\n"
-
-                    with st.expander("Save this so you never have to do it again", expanded=True):
-                        st.markdown("Go to **Streamlit Cloud** > your app > **Settings** > **Secrets** and paste:")
-                        st.code(secrets_toml, language="toml")
-
-                    # Upload now
-                    ok_results = [r for r in st.session_state.results if r['status'] == 'ok']
-                    progress = st.progress(0, text="Uploading to Google Drive...")
-                    status = st.empty()
-
-                    def up_progress_first(current, total, filename):
-                        progress.progress(current / total, text=f"Uploading {current:,} / {total:,}")
-                        status.caption(f"Uploading: {filename}")
-
-                    try:
-                        result = upload_to_drive(
-                            credentials_json=creds_json,
-                            parent_folder_id=folder_id.strip(),
-                            ok_results=ok_results,
-                            uploaded_files=st.session_state.get('files_map', {}),
-                            progress_callback=up_progress_first,
-                        )
-                        progress.progress(1.0, text="Upload complete!")
-                        status.empty()
-                        st.success(f"Uploaded **{result['uploaded']:,}** invoices to Google Drive.")
-                    except Exception as e:
-                        st.error(f"Upload failed: {e}")
+                st.error(
+                    "Google Drive is not configured. See **SETUP_GDRIVE.md** in the project for the "
+                    "one-time setup. After setup, the `[gdrive]` block in `.streamlit/secrets.toml` "
+                    "(or Streamlit Cloud → Settings → Secrets) provides `client_id`, `client_secret`, "
+                    "and `refresh_token` — clients never paste anything."
+                )
 
     # Reset
     st.markdown("")

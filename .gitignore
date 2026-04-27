@@ -13,3 +13,5 @@ report.csv
 exp.PDF
 invoices.zip
 .streamlit/secrets.toml
+gdrive_service_account.json
+scripts/oauth_client.json
